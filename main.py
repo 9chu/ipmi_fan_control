@@ -10,7 +10,7 @@ import pyipmi
 import pyipmi.interfaces
 from pyipmi.sdr import SdrFullSensorRecord
 from pydantic import BaseModel
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union, Optional
 from prettytable import PrettyTable
 
 
@@ -24,6 +24,7 @@ class FanZoneConfig(BaseModel):
     fan_list: List[str]
     temp_watch_list: List[TemperatureThresholdConfig]
     rpm_ratio: List[float]
+    set_value_interval: Optional[Union[float, List[float]]] = 0
 
 
 class AppConfig(BaseModel):
@@ -34,7 +35,6 @@ class AppConfig(BaseModel):
     interface_type: str = "lan"
     ipmb_address: int = 0x20
     trigger_interval: int = 5
-    no_duplicated_set: bool = True
     cpu_fan_cfg: FanZoneConfig
     board_fan_cfg: FanZoneConfig
 
@@ -106,7 +106,7 @@ class IpmiFanControl:
     def _evaluate_zone(self, zone_cfg: FanZoneConfig):
         # 如果规则关闭，则结束
         if not zone_cfg.enable:
-            return None
+            return None, None
 
         # 查询该区域风扇转速
         # fan_rpm_list = self._fetch_sensor_readings(zone_cfg.fan_list)
@@ -140,18 +140,22 @@ class IpmiFanControl:
 
         # 没有传感器读数
         if expected_rpm_level is None:
-            return None
+            return None, None
 
-        # 获取对应的转速
+        # 获取对应的转速和刷新设置的间隔
         i = 0
         target_ratio = zone_cfg.rpm_ratio[0]
+        target_set_interval = zone_cfg.set_value_interval[0] if isinstance(zone_cfg.set_value_interval, list) else \
+            (zone_cfg.set_value_interval if zone_cfg.set_value_interval is not None else 0)
         while expected_rpm_level != 0:
             i += 1
             expected_rpm_level -= 1
             if i >= len(zone_cfg.rpm_ratio):
                 break
             target_ratio = zone_cfg.rpm_ratio[i]
-        return target_ratio
+            if isinstance(zone_cfg.set_value_interval, list) and i < len(zone_cfg.set_value_interval):
+                target_set_interval = zone_cfg.set_value_interval[i]
+        return target_ratio, target_set_interval
 
     def _ipmi_set_fan_speed(self, zone_id: int, ratio_i: float):
         assert zone_id == 0x00 or zone_id == 0x01
@@ -160,32 +164,50 @@ class IpmiFanControl:
             logging.warning(f"Config fan speed too slow, adjust fan speed from {ratio_i} to {ratio}")
         self._connection.raw_command(0, 0x30, [0x70, 0x66, 0x01, zone_id, ratio])
 
+    @staticmethod
+    def _shall_set_fan_speed(last_ratio: Optional[float], last_set_at: int, calc_ratio: float,
+                             calc_set_interval: float):
+        now = time.time()
+        if last_ratio == calc_ratio:
+            # 如果计算的转速和上次设置的转速一样，则检查下是否需要刷新设置
+            if calc_set_interval == 0:
+                return False
+            if now - last_set_at < calc_set_interval:
+                return False
+        return True
+            
     def run(self):
         try:
             last_cpu_zone_ratio = None
+            last_set_cpu_zone_at = 0
             last_board_zone_ratio = None
+            last_set_board_zone_at = 0
             while True:
                 # 清空读数缓存
                 self._sensor_reading_cache = {}
 
                 # 计算各区域温度
                 logging.debug(f"Evaluate CPU zone")
-                ratio = self._evaluate_zone(self._config.cpu_fan_cfg)
+                ratio, set_interval = self._evaluate_zone(self._config.cpu_fan_cfg)
                 if ratio is not None:
-                    if not self._config.no_duplicated_set or last_cpu_zone_ratio != ratio:
+                    if IpmiFanControl._shall_set_fan_speed(last_cpu_zone_ratio, last_set_cpu_zone_at, ratio,
+                                                           set_interval):
                         logging.info(f"CPU zone expected fan ratio: {ratio}%")
                         self._ipmi_set_fan_speed(0, ratio)
                         last_cpu_zone_ratio = ratio
+                        last_set_cpu_zone_at = time.time()
                 else:
                     last_cpu_zone_ratio = None
 
                 logging.debug(f"Evaluate Board zone")
-                ratio = self._evaluate_zone(self._config.board_fan_cfg)
+                ratio, set_interval = self._evaluate_zone(self._config.board_fan_cfg)
                 if ratio is not None:
-                    if not self._config.no_duplicated_set or last_board_zone_ratio != ratio:
+                    if IpmiFanControl._shall_set_fan_speed(last_board_zone_ratio, last_set_board_zone_at, ratio,
+                                                           set_interval):
                         logging.info(f"Board zone expected fan ratio: {ratio}%")
                         self._ipmi_set_fan_speed(1, ratio)
                         last_board_zone_ratio = ratio
+                        last_set_board_zone_at = time.time()
                 else:
                     last_board_zone_ratio = None
 
